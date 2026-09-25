@@ -1,0 +1,218 @@
+name: Ruleset bypass test
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: Behavior to verify
+        required: true
+        default: happy-path
+        type: choice
+        options:
+          - happy-path
+          - failing-ci
+
+permissions:
+  checks: read
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: ruleset-bypass-test
+  cancel-in-progress: false
+
+jobs:
+  verify-bypass-boundaries:
+    name: Verify bypass boundaries
+    runs-on: ubuntu-latest
+    env:
+      BRANCH_NAME: release/PPS_TEST_${{ github.run_id }}
+      TEST_FILE: .ruleset-test
+
+    steps:
+      - name: Create test GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.RULESET_TEST_APP_ID }}
+          private-key: ${{ secrets.RULESET_TEST_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
+      - name: Verify token identity
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          APP_SLUG=$(gh api installation --jq '.app_slug')
+          echo "Authenticated as GitHub App installation: $APP_SLUG"
+
+      - name: Prove GITHUB_TOKEN cannot create protected release branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          MAIN_SHA=$(gh api "repos/${{ github.repository }}/git/ref/heads/main" --jq '.object.sha')
+          if gh api -X POST "repos/${{ github.repository }}/git/refs" \
+            -f ref="refs/heads/$BRANCH_NAME" -f sha="$MAIN_SHA" >/tmp/unexpected-create.json 2>/tmp/create-denied.log; then
+            echo "GITHUB_TOKEN unexpectedly bypassed the release creation rule."
+            exit 1
+          fi
+          echo "Expected denial confirmed for GITHUB_TOKEN branch creation."
+
+      - name: Create protected release branch with App
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          MAIN_SHA=$(gh api "repos/${{ github.repository }}/git/ref/heads/main" --jq '.object.sha')
+          gh api -X POST "repos/${{ github.repository }}/git/refs" \
+            -f ref="refs/heads/$BRANCH_NAME" -f sha="$MAIN_SHA" >/dev/null
+
+      - name: Commit scenario marker with App
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          if [ "${{ inputs.scenario }}" = "failing-ci" ]; then
+            FAIL_CI=true
+          else
+            FAIL_CI=false
+          fi
+          CONTENT=$(printf 'run-id=%s\nscenario=%s\nfail-ci=%s\n' \
+            '${{ github.run_id }}' '${{ inputs.scenario }}' "$FAIL_CI")
+          EXISTING_SHA=$(gh api \
+            "repos/${{ github.repository }}/contents/$TEST_FILE?ref=$BRANCH_NAME" \
+            --jq '.sha' 2>/dev/null || true)
+          jq -n \
+            --arg message "test: ${{ inputs.scenario }} ruleset behavior" \
+            --arg content "$(printf '%s\n' "$CONTENT" | base64 | tr -d '\n')" \
+            --arg branch "$BRANCH_NAME" \
+            --arg sha "$EXISTING_SHA" \
+            '{message: $message, content: $content, branch: $branch}
+              + if $sha == "" then {} else {sha: $sha} end' |
+            gh api -X PUT "repos/${{ github.repository }}/contents/$TEST_FILE" --input - >/dev/null
+
+      - name: Open unapproved pull request with App
+        id: pull-request
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          PR_NUMBER=$(gh api -X POST "repos/${{ github.repository }}/pulls" \
+            -f title="Ruleset test ${{ github.run_id }} (${{ inputs.scenario }})" \
+            -f head="$BRANCH_NAME" \
+            -f base=main \
+            -f body="Automated ruleset boundary test. This PR intentionally has no approval." \
+            --jq '.number')
+          PR_SHA=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER" --jq '.head.sha')
+          echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "sha=$PR_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for required check
+        id: required-check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_SHA: ${{ steps.pull-request.outputs.sha }}
+        run: |
+          for attempt in $(seq 1 40); do
+            CONCLUSION=$(gh api "repos/${{ github.repository }}/commits/$PR_SHA/check-runs?per_page=100" \
+              --jq '[.check_runs[] | select(.name == "Ruleset Test CI")][0].conclusion // "pending"')
+            if [ "$CONCLUSION" != "pending" ] && [ "$CONCLUSION" != "null" ]; then
+              echo "conclusion=$CONCLUSION" >> "$GITHUB_OUTPUT"
+              echo "Required check concluded: $CONCLUSION"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "Required check did not conclude within 10 minutes."
+          exit 1
+
+      - name: Prove GITHUB_TOKEN cannot bypass approval
+        if: inputs.scenario == 'happy-path'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pull-request.outputs.number }}
+          PR_SHA: ${{ steps.pull-request.outputs.sha }}
+        run: |
+          if [ "${{ steps.required-check.outputs.conclusion }}" != "success" ]; then
+            echo "Required check must pass before isolating the approval rule."
+            exit 1
+          fi
+          if gh api -X PUT "repos/${{ github.repository }}/pulls/$PR_NUMBER/merge" \
+            -f merge_method=merge -f sha="$PR_SHA" >/tmp/unexpected-merge.json 2>/tmp/merge-denied.log; then
+            echo "GITHUB_TOKEN unexpectedly merged an unapproved PR."
+            exit 1
+          fi
+          echo "Expected denial confirmed for GITHUB_TOKEN merge."
+
+      - name: Merge unapproved PR with App
+        if: inputs.scenario == 'happy-path'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_NUMBER: ${{ steps.pull-request.outputs.number }}
+          PR_SHA: ${{ steps.pull-request.outputs.sha }}
+        run: |
+          gh api -X PUT "repos/${{ github.repository }}/pulls/$PR_NUMBER/merge" \
+            -f merge_method=merge -f sha="$PR_SHA" --jq '.merged' | grep -qx true
+
+      - name: Prove App cannot bypass failed CI
+        if: inputs.scenario == 'failing-ci'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_NUMBER: ${{ steps.pull-request.outputs.number }}
+          PR_SHA: ${{ steps.pull-request.outputs.sha }}
+        run: |
+          if [ "${{ steps.required-check.outputs.conclusion }}" != "failure" ]; then
+            echo "Expected the deterministic CI check to fail."
+            exit 1
+          fi
+          if gh api -X PUT "repos/${{ github.repository }}/pulls/$PR_NUMBER/merge" \
+            -f merge_method=merge -f sha="$PR_SHA" >/tmp/unexpected-merge.json 2>/tmp/merge-denied.log; then
+            echo "App unexpectedly bypassed the separate required-check ruleset."
+            exit 1
+          fi
+          echo "Expected denial confirmed: App cannot bypass failed CI."
+          gh api -X PATCH "repos/${{ github.repository }}/pulls/$PR_NUMBER" -f state=closed >/dev/null
+
+      - name: Prove GITHUB_TOKEN cannot delete protected release branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh api -X DELETE "repos/${{ github.repository }}/git/refs/heads/$BRANCH_NAME" \
+            >/tmp/unexpected-delete.json 2>/tmp/delete-denied.log; then
+            echo "GITHUB_TOKEN unexpectedly deleted the protected release branch."
+            exit 1
+          fi
+          echo "Expected denial confirmed for GITHUB_TOKEN deletion."
+
+      - name: Delete protected release branch with App
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          gh api -X DELETE "repos/${{ github.repository }}/git/refs/heads/$BRANCH_NAME"
+          if gh api "repos/${{ github.repository }}/git/ref/heads/$BRANCH_NAME" \
+            >/tmp/unexpected-branch.json 2>/dev/null; then
+            echo "Release branch still exists after App deletion."
+            exit 1
+          fi
+          echo "App deletion confirmed by a missing branch ref."
+
+      - name: Clean up test resources
+        if: always() && steps.app-token.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_NUMBER: ${{ steps.pull-request.outputs.number }}
+        run: |
+          if [ -n "$PR_NUMBER" ]; then
+            gh api -X PATCH "repos/${{ github.repository }}/pulls/$PR_NUMBER" \
+              -f state=closed >/dev/null 2>&1 || true
+          fi
+          gh api -X DELETE "repos/${{ github.repository }}/git/refs/heads/$BRANCH_NAME" \
+            >/dev/null 2>&1 || true
+
+      - name: Publish evidence
+        if: always()
+        run: |
+          {
+            echo "## Ruleset bypass test"
+            echo "- Scenario: \`${{ inputs.scenario }}\`"
+            echo "- Branch: \`$BRANCH_NAME\`"
+            echo "- Required check: \`${{ steps.required-check.outputs.conclusion || 'not observed' }}\`"
+            echo "- Result: \`${{ job.status }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

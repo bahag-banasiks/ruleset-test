@@ -1,0 +1,25 @@
+name: Ruleset Test
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  required-check:
+    name: Ruleset Test CI
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out test branch
+        uses: actions/checkout@v4
+
+      - name: Run deterministic test
+        run: |
+          if grep -q '^fail-ci=true$' .ruleset-test 2>/dev/null; then
+            echo "Intentional failure: the App must not bypass this required check."
+            exit 1
+          fi
+          echo "Required ruleset check passed."
