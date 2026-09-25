@@ -39,12 +39,13 @@ jobs:
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
 
-      - name: Verify token identity
+      - name: Verify App repository access
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
-          APP_SLUG=$(gh api installation --jq '.app_slug')
-          echo "Authenticated as GitHub App installation: $APP_SLUG"
+          REPOSITORY=$(gh api "repos/${{ github.repository }}" --jq '.full_name')
+          test "$REPOSITORY" = "${{ github.repository }}"
+          echo "GitHub App installation can access $REPOSITORY."
 
       - name: Prove GITHUB_TOKEN cannot create protected release branch
         env:
